@@ -31,6 +31,9 @@ result
 CLAUDE.md
 .claude/
 AGENTS.override.md
+AGENTS.md
+build_and_update.sh
+codex-rs/build_release.sh
 
 # caches
 .cache/

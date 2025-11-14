@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::env;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,6 +69,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -483,9 +486,8 @@ impl ChatWidget {
         // If there is a queued user message, send exactly one now to begin the next turn.
         self.maybe_send_next_queued_input();
         // Emit a notification when the turn completes (suppressed if focused).
-        self.notify(Notification::AgentTurnComplete {
-            response: last_agent_message.unwrap_or_default(),
-        });
+        let response = last_agent_message.unwrap_or_default();
+        self.notify(Notification::AgentTurnComplete { response });
 
         self.maybe_show_pending_rate_limit_prompt();
     }
@@ -1800,14 +1802,118 @@ impl ChatWidget {
         if !notification.allowed_for(&self.config.tui_notifications) {
             return;
         }
+
         self.pending_notification = Some(notification);
         self.request_redraw();
     }
 
+    fn hook_message(&self, notification: &Notification) -> Option<String> {
+        match notification {
+            Notification::AgentTurnComplete { response } => {
+                if response.is_empty() {
+                    None
+                } else {
+                    Some(response.clone())
+                }
+            }
+            Notification::ExecApprovalRequested { command } => {
+                Some(format!("Exec approval needed: {command}"))
+            }
+            Notification::EditApprovalRequested { cwd, changes } => {
+                let message = if changes.len() == 1 {
+                    #[allow(clippy::unwrap_used)]
+                    let path = display_path_for(changes.first().unwrap(), cwd);
+                    format!("Edit approval needed for {path}")
+                } else {
+                    format!("Edit approval needed for {} files", changes.len())
+                };
+                Some(message)
+            }
+        }
+    }
+
+    fn trigger_action_hook(&self, message: &str) -> Option<tokio::task::JoinHandle<bool>> {
+        let Ok(raw_command) = env::var("LLM_ACTION_DONE") else {
+            return None;
+        };
+        let trimmed = raw_command.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let Some(mut parts) = Self::parse_action_hook_command(trimmed) else {
+            tracing::warn!("LLM_ACTION_DONE value could not be parsed as shell words: {trimmed}");
+            return None;
+        };
+        if parts.is_empty() {
+            return None;
+        }
+        let program = parts.remove(0);
+        let mut args = parts;
+        let folder_path = self.config.cwd.display().to_string();
+        let truncated = truncate_text(message, 50);
+        args.push(folder_path);
+        args.push(truncated);
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!("Skipping LLM_ACTION_DONE hook; no Tokio runtime available");
+            return None;
+        }
+
+        Some(tokio::spawn(async move {
+            let mut command = TokioCommand::new(program);
+            command.args(args);
+            command.stdin(Stdio::null());
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
+
+            match command.status().await {
+                Ok(status) => {
+                    if !status.success() {
+                        tracing::warn!(
+                            "LLM_ACTION_DONE command exited with non-success status: {status}"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("Failed to run LLM_ACTION_DONE command: {err}");
+                    false
+                }
+            }
+        }))
+    }
+
+    fn parse_action_hook_command(command: &str) -> Option<Vec<String>> {
+        #[cfg(windows)]
+        {
+            let escaped = command.replace('\\', "\\\\");
+            shlex::split(&escaped)
+        }
+        #[cfg(not(windows))]
+        {
+            shlex::split(command)
+        }
+    }
+
     pub(crate) fn maybe_post_pending_notification(&mut self, tui: &mut crate::tui::Tui) {
         if let Some(notif) = self.pending_notification.take() {
-            tui.notify(notif.display());
+            let hook_message = self.hook_message(&notif);
+            let posted = tui.notify(notif.display());
+            let _ = self.maybe_run_action_hook(hook_message.as_deref(), posted);
         }
+    }
+
+    fn maybe_run_action_hook(
+        &self,
+        message: Option<&str>,
+        notification_posted: bool,
+    ) -> Option<tokio::task::JoinHandle<bool>> {
+        if notification_posted && let Some(message) = message {
+            return self.trigger_action_hook(message);
+        }
+        None
     }
 
     /// Mark the active cell as failed (✗) and flush it into history.

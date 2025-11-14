@@ -61,6 +61,44 @@ use tempfile::NamedTempFile;
 use tempfile::tempdir;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::time::Duration;
+use tokio::time::sleep;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::sync::OnceLock;
+#[cfg(unix)]
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+static HOOK_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 fn set_windows_sandbox_enabled(enabled: bool) {
@@ -888,6 +926,84 @@ fn streaming_final_answer_keeps_task_running_state() {
         other => panic!("expected Op::Interrupt, got {other:?}"),
     }
     assert!(chat.bottom_pane.ctrl_c_quit_hint_visible());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completion_hook_runs_llm_action_done_command() {
+    let _lock = HOOK_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let dir = tempdir().expect("tempdir");
+    let script_path = dir.path().join("hook.sh");
+    let log_path = dir.path().join("hook.log");
+    std::fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\n\
+             printf \"%s\\n%s\\n\" \"$1\" \"$2\" > \"{log}\"\n",
+            log = log_path.display()
+        ),
+    )
+    .expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+
+    let _guard = EnvVarGuard::set("LLM_ACTION_DONE", script_path.as_os_str());
+
+    let (chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    let expected_path = chat.config.cwd.display().to_string();
+    let response =
+        "This response should be truncated because it is deliberately long for testing the hook";
+    let expected_message = truncate_text(response, 50);
+
+    let handle = chat
+        .maybe_run_action_hook(Some(response), true)
+        .expect("hook should spawn task");
+    assert!(handle.await.expect("hook task should complete"));
+    let contents = std::fs::read_to_string(&log_path).expect("hook log should exist");
+    assert_eq!(contents, format!("{expected_path}\n{expected_message}\n"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completion_hook_skips_when_notification_not_posted() {
+    let _lock = HOOK_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let dir = tempdir().expect("tempdir");
+    let script_path = dir.path().join("hook.sh");
+    let log_path = dir.path().join("hook.log");
+    std::fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\n\
+             printf \"%s\\n%s\\n\" \"$1\" \"$2\" > \"{log}\"\n",
+            log = log_path.display()
+        ),
+    )
+    .expect("write script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+
+    let _guard = EnvVarGuard::set("LLM_ACTION_DONE", script_path.as_os_str());
+
+    let (chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    let response =
+        "This response should be truncated because it is deliberately long for testing the hook";
+
+    let handle = chat.maybe_run_action_hook(Some(response), false);
+    assert!(handle.is_none(), "hook should not spawn when not posted");
+
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !log_path.exists(),
+        "hook log should not exist when notification was not posted"
+    );
 }
 
 #[test]

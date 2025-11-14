@@ -1,3 +1,19 @@
+## Local Fork Changes
+
+This fork currently includes local work that has not been merged upstream. Highlights:
+
+- The resume UX is now working-directory aware end-to-end: `codex resume` filters sessions to the current project, offers a `--all-dirs` override, shows Esc-based previews so you can fork earlier turns, updates the TUI picker (`codex-rs/tui/src/resume_picker.rs`, `chatwidget.rs`, and related snapshots) to display directory metadata inline, and adds a <kbd>Ctrl</kbd>+<kbd>U</kbd> shortcut to sort by **Updated**.
+- `codex-rs/Cargo.toml`, `Cargo.lock`, and every crate under `codex-rs/` have been bumped to version `0.57.0-alpha.3`, along with status/approval overlay improvements and expanded core/client plumbing needed to support the new resume metadata.
+- `docs/CODEX.md` and `docs/getting-started.md` document the resume workflow, recovery steps, and the new CLI flags so the behavior is discoverable.
+- `update_and_build.sh`, `build_and_update.sh`, and `codex-rs/build_release.sh` provide scripted workflows for stashing, updating, and producing release binaries without debug symbols.
+- `sync_fork.sh` performs the upstream rebase + `--force-with-lease` push flow (works across repos via `--dir/--branch/--upstream/--origin/--upstream-url` flags), so keeping this fork—or any other—aligned with its upstream is a one-command operation.
+- Several `.snap.new` files under `codex-rs/tui/src/status/snapshots/` capture pending TUI snapshot updates from local testing.
+
+These notes are meant to make it easier to reconcile this fork with upstream `main` or to upstream the work later.
+
+---
+
+
 <p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
 
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
