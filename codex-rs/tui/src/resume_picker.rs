@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
@@ -32,6 +34,9 @@ use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SessionMetaLine;
 
 const PAGE_SIZE: usize = 25;
 const LOAD_NEAR_THRESHOLD: usize = 5;
@@ -69,6 +74,7 @@ pub async fn run_resume_picker(
     tui: &mut Tui,
     codex_home: &Path,
     default_provider: &str,
+    cwd_filter: Option<&Path>,
 ) -> Result<ResumeSelection> {
     let alt = AltScreenGuard::enter(tui);
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
@@ -102,6 +108,7 @@ pub async fn run_resume_picker(
         alt.tui.frame_requester(),
         page_loader,
         default_provider.clone(),
+        cwd_filter.map(Path::to_path_buf),
     );
     state.load_initial_page().await?;
     state.request_frame();
@@ -167,6 +174,7 @@ struct PickerState {
     pagination: PaginationState,
     all_rows: Vec<Row>,
     filtered_rows: Vec<Row>,
+    cwd_filter: Option<PathBuf>,
     seen_paths: HashSet<PathBuf>,
     selected: usize,
     scroll_top: usize,
@@ -177,6 +185,7 @@ struct PickerState {
     page_loader: PageLoader,
     view_rows: Option<usize>,
     default_provider: String,
+    sort_mode: SortMode,
 }
 
 struct PaginationState {
@@ -209,6 +218,25 @@ enum LoadTrigger {
     Search { token: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortMode {
+    BackendOrder,
+    UpdatedNewestFirst,
+}
+
+impl SortMode {
+    fn description(self) -> &'static str {
+        match self {
+            SortMode::BackendOrder => "Sort: server order",
+            SortMode::UpdatedNewestFirst => "Sort: Updated (newest first)",
+        }
+    }
+
+    fn is_updated(self) -> bool {
+        matches!(self, SortMode::UpdatedNewestFirst)
+    }
+}
+
 impl LoadingState {
     fn is_pending(&self) -> bool {
         matches!(self, LoadingState::Pending(_))
@@ -231,6 +259,7 @@ impl SearchState {
 #[derive(Clone)]
 struct Row {
     path: PathBuf,
+    cwd: Option<PathBuf>,
     preview: String,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
@@ -242,6 +271,7 @@ impl PickerState {
         requester: FrameRequester,
         page_loader: PageLoader,
         default_provider: String,
+        cwd_filter: Option<PathBuf>,
     ) -> Self {
         Self {
             codex_home,
@@ -254,6 +284,7 @@ impl PickerState {
             },
             all_rows: Vec::new(),
             filtered_rows: Vec::new(),
+            cwd_filter,
             seen_paths: HashSet::new(),
             selected: 0,
             scroll_top: 0,
@@ -264,6 +295,7 @@ impl PickerState {
             page_loader,
             view_rows: None,
             default_provider,
+            sort_mode: SortMode::BackendOrder,
         }
     }
 
@@ -280,6 +312,11 @@ impl PickerState {
                     .contains(crossterm::event::KeyModifiers::CONTROL) =>
             {
                 return Ok(Some(ResumeSelection::Exit));
+            }
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.toggle_sort_mode();
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
@@ -418,17 +455,20 @@ impl PickerState {
     }
 
     fn apply_filter(&mut self) {
-        if self.query.is_empty() {
-            self.filtered_rows = self.all_rows.clone();
-        } else {
-            let q = self.query.to_lowercase();
-            self.filtered_rows = self
-                .all_rows
-                .iter()
-                .filter(|r| r.preview.to_lowercase().contains(&q))
-                .cloned()
-                .collect();
+        let mut filtered: Vec<Row> = self
+            .all_rows
+            .iter()
+            .filter(|row| self.matches_directory(row))
+            .cloned()
+            .collect();
+
+        if !self.query.is_empty() {
+            let needle = self.query.to_lowercase();
+            filtered.retain(|row| row.preview.to_lowercase().contains(&needle));
         }
+
+        self.filtered_rows = filtered;
+        self.sort_filtered_rows();
         if self.selected >= self.filtered_rows.len() {
             self.selected = self.filtered_rows.len().saturating_sub(1);
         }
@@ -437,6 +477,51 @@ impl PickerState {
         }
         self.ensure_selected_visible();
         self.request_frame();
+    }
+
+    fn sort_filtered_rows(&mut self) {
+        if matches!(self.sort_mode, SortMode::BackendOrder) {
+            return;
+        }
+        self.filtered_rows
+            .sort_by(compare_updated_desc);
+    }
+
+    fn toggle_sort_mode(&mut self) {
+        let next = match self.sort_mode {
+            SortMode::BackendOrder => SortMode::UpdatedNewestFirst,
+            SortMode::UpdatedNewestFirst => SortMode::BackendOrder,
+        };
+        self.set_sort_mode(next);
+    }
+
+    fn set_sort_mode(&mut self, mode: SortMode) {
+        if self.sort_mode == mode {
+            return;
+        }
+        let selected_path = self
+            .filtered_rows
+            .get(self.selected)
+            .map(|row| row.path.clone());
+        self.sort_mode = mode;
+        self.apply_filter();
+        if let Some(path) = selected_path
+            && let Some(idx) = self.filtered_rows.iter().position(|row| row.path == path) {
+                self.selected = idx;
+            }
+        self.ensure_selected_visible();
+        self.request_frame();
+    }
+
+    fn matches_directory(&self, row: &Row) -> bool {
+        match self.cwd_filter.as_ref() {
+            None => true,
+            Some(filter) => row.cwd.as_ref().map(|cwd| cwd == filter).unwrap_or(false),
+        }
+    }
+
+    fn is_directory_filtered(&self) -> bool {
+        self.cwd_filter.is_some()
     }
 
     fn set_query(&mut self, new_query: String) {
@@ -613,6 +698,7 @@ fn head_to_row(item: &ConversationItem) -> Row {
 
     Row {
         path: item.path.clone(),
+        cwd: extract_cwd(&item.head),
         preview,
         created_at,
         updated_at,
@@ -631,6 +717,19 @@ fn extract_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
         .and_then(|v| v.as_str())
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn extract_cwd(head: &[serde_json::Value]) -> Option<PathBuf> {
+    for value in head {
+        if let Ok(meta_line) = serde_json::from_value::<SessionMetaLine>(value.clone()) {
+            return Some(meta_line.meta.cwd);
+        }
+        if let Ok(line) = serde_json::from_value::<RolloutLine>(value.clone())
+            && let RolloutItem::SessionMeta(meta) = line.item {
+                return Some(meta.meta.cwd);
+            }
+    }
+    None
 }
 
 fn preview_from_head(head: &[serde_json::Value]) -> Option<String> {
@@ -662,18 +761,21 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
             header,
         );
 
-        // Search line
-        let q = if state.query.is_empty() {
-            "Type to search".dim().to_string()
+        // Search line with sort status
+        let query_span: Span = if state.query.is_empty() {
+            "Type to search".dim()
         } else {
-            format!("Search: {}", state.query)
+            format!("Search: {}", state.query).into()
         };
-        frame.render_widget_ref(Line::from(q), search);
+        let mut search_spans = vec![query_span];
+        search_spans.push("    ".into());
+        search_spans.push(state.sort_mode.description().dim());
+        frame.render_widget_ref(Line::from(search_spans), search);
 
         let metrics = calculate_column_metrics(&state.filtered_rows);
 
         // Column headers and list
-        render_column_headers(frame, columns, &metrics);
+        render_column_headers(frame, columns, &metrics, state.sort_mode);
         render_list(frame, list, state, &metrics);
 
         // Hint line
@@ -691,6 +793,9 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
             "/".dim(),
             key_hint::plain(KeyCode::Down).into(),
             " to browse".dim(),
+            "    ".dim(),
+            key_hint::ctrl(KeyCode::Char('u')).into(),
+            " toggle Updated sort".dim(),
         ]
         .into();
         frame.render_widget_ref(hint_line, hint);
@@ -753,7 +858,16 @@ fn render_list(
         if add_leading_gap {
             preview_width = preview_width.saturating_sub(2);
         }
-        let preview = truncate_text(&row.preview, preview_width);
+        let mut preview_text = row.preview.clone();
+        if !state.is_directory_filtered() {
+            let path_display = row
+                .cwd
+                .as_ref()
+                .map(|cwd| cwd.display().to_string())
+                .unwrap_or_else(|| row.path.display().to_string());
+            preview_text = format!("{preview_text}  {path_display}");
+        }
+        let preview = truncate_text(&preview_text, preview_width);
         let mut spans: Vec<Span> = vec![marker];
         if let Some(created) = created_span {
             spans.push(created);
@@ -796,6 +910,13 @@ fn render_empty_state_line(state: &PickerState) -> Line<'static> {
             return vec![Span::from(msg).italic().dim()].into();
         }
         return vec!["No results for your search".italic().dim()].into();
+    }
+
+    if state.filtered_rows.is_empty() && state.is_directory_filtered() {
+        if state.pagination.loading.is_pending() {
+            return vec!["Loading older sessions…".italic().dim()].into();
+        }
+        return vec!["No sessions for this directory".italic().dim()].into();
     }
 
     if state.all_rows.is_empty() && state.pagination.num_scanned_files == 0 {
@@ -858,10 +979,24 @@ fn format_updated_label(row: &Row) -> String {
     }
 }
 
+fn compare_updated_desc(a: &Row, b: &Row) -> Ordering {
+    let a_key = updated_sort_key(a);
+    let b_key = updated_sort_key(b);
+    match b_key.cmp(&a_key) {
+        Ordering::Equal => a.path.cmp(&b.path),
+        other => other,
+    }
+}
+
+fn updated_sort_key(row: &Row) -> Option<&DateTime<Utc>> {
+    row.updated_at.as_ref().or(row.created_at.as_ref())
+}
+
 fn render_column_headers(
     frame: &mut crate::custom_terminal::Frame,
     area: Rect,
     metrics: &ColumnMetrics,
+    sort_mode: SortMode,
 ) {
     if area.height == 0 {
         return;
@@ -883,7 +1018,15 @@ fn render_column_headers(
             text = "Updated",
             width = metrics.max_updated_width
         );
-        spans.push(Span::from(label).bold());
+        let updated_span = if sort_mode.is_updated() {
+            Span::from(label).bold().cyan()
+        } else {
+            Span::from(label).bold()
+        };
+        spans.push(updated_span);
+        if sort_mode.is_updated() {
+            spans.push(" ▼".cyan());
+        }
         spans.push("  ".into());
     }
     spans.push("Conversation".bold());
@@ -913,6 +1056,18 @@ fn calculate_column_metrics(rows: &[Row]) -> ColumnMetrics {
         max_created_width,
         max_updated_width,
         labels,
+    }
+}
+
+pub(crate) fn conversation_item_matches_cwd(
+    item: &ConversationItem,
+    filter: Option<&Path>,
+) -> bool {
+    match filter {
+        None => true,
+        Some(cwd) => extract_cwd(&item.head)
+            .map(|entry| entry == cwd)
+            .unwrap_or(false),
     }
 }
 
@@ -1042,6 +1197,41 @@ mod tests {
     }
 
     #[test]
+    fn head_to_row_extracts_cwd_from_session_meta() {
+        let head = vec![
+            json!({
+                "timestamp": "2025-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "0199abcd-1234-5678-90ab-ffffffffffff",
+                    "timestamp": "2025-01-01T00:00:00Z",
+                    "cwd": "/tmp/project",
+                    "originator": "codex_cli_rs",
+                    "cli_version": "0.47.0",
+                    "instructions": null,
+                    "source": "cli"
+                }
+            }),
+            json!({
+                "timestamp": "2025-01-01T00:00:01Z",
+                "type": "message",
+                "role": "user",
+                "content": [ { "type": "input_text", "text": "hello" } ]
+            }),
+        ];
+        let item = ConversationItem {
+            path: PathBuf::from("/tmp/a.jsonl"),
+            head,
+            tail: Vec::new(),
+            created_at: Some("2025-01-01T00:00:00Z".into()),
+            updated_at: Some("2025-01-01T00:00:00Z".into()),
+        };
+
+        let row = head_to_row(&item);
+        assert_eq!(row.cwd.as_deref(), Some(Path::new("/tmp/project")));
+    }
+
+    #[test]
     fn row_uses_tail_timestamp_for_updated_at() {
         let head = head_with_ts_and_user_text("2025-01-01T00:00:00Z", &["Hello"]);
         let tail = vec![json!({
@@ -1076,6 +1266,41 @@ mod tests {
     }
 
     #[test]
+    fn apply_filter_respects_cwd() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let cwd = PathBuf::from("/workspace/project");
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            Some(cwd.clone()),
+        );
+
+        let rows = vec![
+            Row {
+                path: PathBuf::from("/tmp/a.jsonl"),
+                cwd: Some(cwd),
+                preview: String::from("Matches filter"),
+                created_at: None,
+                updated_at: None,
+            },
+            Row {
+                path: PathBuf::from("/tmp/b.jsonl"),
+                cwd: Some(PathBuf::from("/some/other/place")),
+                preview: String::from("Filtered out"),
+                created_at: None,
+                updated_at: None,
+            },
+        ];
+        state.all_rows = rows;
+        state.apply_filter();
+
+        assert_eq!(state.filtered_rows.len(), 1);
+        assert_eq!(state.filtered_rows[0].preview, "Matches filter");
+    }
+
+    #[test]
     fn resume_table_snapshot() {
         use crate::custom_terminal::Terminal;
         use crate::test_backend::VT100Backend;
@@ -1088,24 +1313,28 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            Some(PathBuf::from("/workspace/project")),
         );
 
         let now = Utc::now();
         let rows = vec![
             Row {
                 path: PathBuf::from("/tmp/a.jsonl"),
+                cwd: Some(PathBuf::from("/workspace/project")),
                 preview: String::from("Fix resume picker timestamps"),
                 created_at: Some(now - Duration::minutes(16)),
                 updated_at: Some(now - Duration::seconds(42)),
             },
             Row {
                 path: PathBuf::from("/tmp/b.jsonl"),
+                cwd: Some(PathBuf::from("/workspace/project")),
                 preview: String::from("Investigate lazy pagination cap"),
                 created_at: Some(now - Duration::hours(1)),
                 updated_at: Some(now - Duration::minutes(35)),
             },
             Row {
                 path: PathBuf::from("/tmp/c.jsonl"),
+                cwd: Some(PathBuf::from("/workspace/project")),
                 preview: String::from("Explain the codebase"),
                 created_at: Some(now - Duration::hours(2)),
                 updated_at: Some(now - Duration::hours(2)),
@@ -1131,13 +1360,63 @@ mod tests {
             let area = frame.area();
             let segments =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-            render_column_headers(&mut frame, segments[0], &metrics);
+            render_column_headers(&mut frame, segments[0], &metrics, state.sort_mode);
             render_list(&mut frame, segments[1], &state, &metrics);
         }
         terminal.flush().expect("flush");
 
         let snapshot = terminal.backend().to_string();
         assert_snapshot!("resume_picker_table", snapshot);
+    }
+
+    #[test]
+    fn ctrl_u_toggles_sorting_by_updated_timestamp() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            None,
+        );
+
+        let now = Utc::now();
+        state.all_rows = vec![
+            Row {
+                path: PathBuf::from("/tmp/older.jsonl"),
+                cwd: None,
+                preview: String::from("older entry"),
+                created_at: Some(now - Duration::hours(2)),
+                updated_at: Some(now - Duration::hours(2)),
+            },
+            Row {
+                path: PathBuf::from("/tmp/newer.jsonl"),
+                cwd: None,
+                preview: String::from("newer entry"),
+                created_at: Some(now - Duration::hours(1)),
+                updated_at: Some(now - Duration::minutes(5)),
+            },
+        ];
+        state.apply_filter();
+        assert_eq!(state.filtered_rows[0].preview, "older entry");
+
+        block_on_future(async {
+            state
+                .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+        });
+        assert_eq!(state.filtered_rows[0].preview, "newer entry");
+        assert!(matches!(state.sort_mode, SortMode::UpdatedNewestFirst));
+
+        block_on_future(async {
+            state
+                .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+        });
+        assert!(matches!(state.sort_mode, SortMode::BackendOrder));
+        assert_eq!(state.filtered_rows[0].preview, "older entry");
     }
 
     #[test]
@@ -1148,6 +1427,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            None,
         );
 
         state.reset_pagination();
@@ -1214,6 +1494,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            None,
         );
         state.reset_pagination();
         state.ingest_page(page(
@@ -1243,6 +1524,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            None,
         );
 
         let mut items = Vec::new();
@@ -1291,6 +1573,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            None,
         );
 
         let mut items = Vec::new();
@@ -1335,6 +1618,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            None,
         );
         state.reset_pagination();
         state.ingest_page(page(

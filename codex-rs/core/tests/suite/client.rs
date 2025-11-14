@@ -307,6 +307,204 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn falls_back_to_supported_reasoning_effort_when_low_rejected() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+
+    let rejection = json!({
+        "error": {
+            "message": "Unsupported value: 'low' is not supported with the 'codex-1p-ninetales-codexswic-ev3' model. Supported values are: 'medium'.",
+        }
+    });
+
+    let first = ResponseTemplate::new(400)
+        .insert_header("content-type", "application/json")
+        .set_body_json(rejection.clone());
+
+    let second = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(sse_completed("resp1"), "text/event-stream");
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_string_contains("\"effort\":\"low\""))
+        .respond_with(first)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_string_contains("\"effort\":\"medium\""))
+        .respond_with(second)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = built_in_model_providers()["openai"].clone();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.request_max_retries = Some(0);
+
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = provider;
+    config.model_reasoning_effort = Some(ReasoningEffort::Low);
+
+    let conversation_manager = ConversationManager::with_auth(create_dummy_codex_auth());
+    let codex = conversation_manager
+        .new_conversation(config)
+        .await
+        .expect("create new conversation")
+        .conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+            }],
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    let requests = server.received_requests().await.unwrap();
+    let mut low_index = None;
+    let mut medium_index = None;
+
+    for (idx, request) in requests.iter().enumerate() {
+        let effort = request
+            .body_json::<serde_json::Value>()
+            .ok()
+            .and_then(|body| {
+                body.get("reasoning")?
+                    .get("effort")?
+                    .as_str()
+                    .map(str::to_string)
+            });
+
+        match effort.as_deref() {
+            Some("low") if low_index.is_none() => {
+                low_index = Some(idx);
+            }
+            Some("medium") if low_index.is_some() => {
+                medium_index = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let low_index = low_index.expect("expected at least one request using low reasoning effort");
+    let medium_index =
+        medium_index.expect("expected fallback request using medium reasoning effort");
+    assert!(
+        medium_index > low_index,
+        "fallback request should occur after the initial low effort request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn falls_back_to_supported_text_verbosity_when_low_rejected() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+
+    let rejection = json!({
+        "error": {
+            "message": "Unsupported value: 'low' is not supported with the 'codex-1p-ninetales-codexswic-ev3' model. Supported values are: 'medium'.",
+            "param": "text.verbosity",
+        }
+    });
+
+    let first = ResponseTemplate::new(400)
+        .insert_header("content-type", "application/json")
+        .set_body_json(rejection.clone());
+
+    let second = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(sse_completed("resp1"), "text/event-stream");
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_string_contains("\"verbosity\":\"low\""))
+        .respond_with(first)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_string_contains("\"verbosity\":\"medium\""))
+        .respond_with(second)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = built_in_model_providers()["openai"].clone();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.request_max_retries = Some(0);
+
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = provider;
+    config.model_verbosity = Some(Verbosity::Low);
+
+    let conversation_manager = ConversationManager::with_auth(create_dummy_codex_auth());
+    let codex = conversation_manager
+        .new_conversation(config)
+        .await
+        .expect("create new conversation")
+        .conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+            }],
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    let requests = server.received_requests().await.unwrap();
+    let mut low_index = None;
+    let mut medium_index = None;
+
+    for (idx, request) in requests.iter().enumerate() {
+        let verbosity = request
+            .body_json::<serde_json::Value>()
+            .ok()
+            .and_then(|body| {
+                body.get("text")?
+                    .get("verbosity")?
+                    .as_str()
+                    .map(str::to_string)
+            });
+
+        match verbosity.as_deref() {
+            Some("low") if low_index.is_none() => {
+                low_index = Some(idx);
+            }
+            Some("medium") if low_index.is_some() => {
+                medium_index = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let low_index = low_index.expect("expected at least one request using low text verbosity");
+    let medium_index = medium_index.expect("expected fallback request using medium text verbosity");
+    assert!(
+        medium_index > low_index,
+        "fallback request should occur after the initial low text verbosity request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_conversation_id_and_model_headers_in_request() {
     skip_if_no_network!();
 

@@ -18,17 +18,22 @@ Key flags: `--model/-m`, `--ask-for-approval/-a`.
 
 ### Resuming interactive sessions
 
-- Run `codex resume` to display the session picker UI
-- Resume most recent: `codex resume --last`
+- Run `codex resume` to display the session picker UI scoped to the current working directory
+- Show sessions from every directory: `codex resume --all-dirs`
+- Resume the most recent for this directory: `codex resume --last`
 - Resume by id: `codex resume <SESSION_ID>` (You can get session ids from /status or `~/.codex/sessions/`)
+- Inside the picker UI, press <kbd>Ctrl</kbd>+<kbd>U</kbd> to toggle sorting by the **Updated** column (newest edits first).
 
 Examples:
 
 ```shell
-# Open a picker of recent sessions
+# Open a picker of recent sessions in the current directory
 codex resume
 
-# Resume the most recent session
+# Browse every saved session regardless of directory
+codex resume --all-dirs
+
+# Resume the most recent session in this directory
 codex resume --last
 
 # Resume a specific session by id

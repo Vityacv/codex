@@ -10,6 +10,7 @@ use codex_app_server_protocol::AuthMode;
 use codex_core::AuthManager;
 use codex_core::BUILT_IN_OSS_MODEL_PROVIDER_ID;
 use codex_core::CodexAuth;
+use codex_core::Cursor;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
 use codex_core::auth::enforce_login_restrictions;
@@ -78,6 +79,8 @@ mod updates;
 mod version;
 
 mod wrapping;
+
+const RESUME_LAST_PAGE_SIZE: usize = 25;
 
 #[cfg(test)]
 pub mod test_backend;
@@ -393,6 +396,12 @@ async fn run_ratatui_app(
         initial_config
     };
 
+    let resume_cwd_filter = if cli.resume_all_dirs {
+        None
+    } else {
+        Some(config.cwd.clone())
+    };
+
     // Determine resume behavior: explicit id, then resume last, then picker.
     let resume_selection = if let Some(id_str) = cli.resume_session_id.as_deref() {
         match find_conversation_path_by_id_str(&config.codex_home, id_str).await? {
@@ -417,28 +426,42 @@ async fn run_ratatui_app(
         }
     } else if cli.resume_last {
         let provider_filter = vec![config.model_provider_id.clone()];
-        match RolloutRecorder::list_conversations(
-            &config.codex_home,
-            1,
-            None,
-            INTERACTIVE_SESSION_SOURCES,
-            Some(provider_filter.as_slice()),
-            &config.model_provider_id,
-        )
-        .await
-        {
-            Ok(page) => page
+        let filter = resume_cwd_filter.as_deref();
+        let mut cursor: Option<Cursor> = None;
+        loop {
+            let page = match RolloutRecorder::list_conversations(
+                &config.codex_home,
+                RESUME_LAST_PAGE_SIZE,
+                cursor.as_ref(),
+                INTERACTIVE_SESSION_SOURCES,
+                Some(provider_filter.as_slice()),
+                &config.model_provider_id,
+            )
+            .await
+            {
+                Ok(page) => page,
+                Err(_) => break resume_picker::ResumeSelection::StartFresh,
+            };
+
+            if let Some(item) = page
                 .items
-                .first()
-                .map(|it| resume_picker::ResumeSelection::Resume(it.path.clone()))
-                .unwrap_or(resume_picker::ResumeSelection::StartFresh),
-            Err(_) => resume_picker::ResumeSelection::StartFresh,
+                .iter()
+                .find(|it| resume_picker::conversation_item_matches_cwd(it, filter))
+            {
+                break resume_picker::ResumeSelection::Resume(item.path.clone());
+            }
+
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break resume_picker::ResumeSelection::StartFresh,
+            }
         }
     } else if cli.resume_picker {
         match resume_picker::run_resume_picker(
             &mut tui,
             &config.codex_home,
             &config.model_provider_id,
+            resume_cwd_filter.as_deref(),
         )
         .await?
         {

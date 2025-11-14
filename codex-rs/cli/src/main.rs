@@ -100,6 +100,8 @@ enum Subcommand {
     /// Resume a previous interactive session (picker by default; use --last to continue the most recent).
     Resume(ResumeCommand),
 
+    /// [experimental] Generate TypeScript bindings for the app server protocol.
+    GenerateTs(GenerateTsCommand),
     /// [EXPERIMENTAL] Browse tasks from Codex Cloud and apply changes locally.
     #[clap(name = "cloud", alias = "cloud-tasks")]
     Cloud(CloudTasksCli),
@@ -133,6 +135,10 @@ struct ResumeCommand {
     /// Continue the most recent session without showing the picker.
     #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
     last: bool,
+
+    /// List sessions from every directory instead of filtering to the current working directory.
+    #[arg(long = "all-dirs", default_value_t = false)]
+    all_dirs: bool,
 
     #[clap(flatten)]
     config_overrides: TuiCli,
@@ -448,6 +454,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         Some(Subcommand::Resume(ResumeCommand {
             session_id,
             last,
+            all_dirs,
             config_overrides,
         })) => {
             interactive = finalize_resume_interactive(
@@ -455,6 +462,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 root_config_overrides.clone(),
                 session_id,
                 last,
+                all_dirs,
                 config_overrides,
             );
             let exit_info = codex_tui::run_main(interactive, codex_linux_sandbox_exe).await?;
@@ -559,6 +567,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             tokio::task::spawn_blocking(move || codex_stdio_to_uds::run(socket_path.as_path()))
                 .await??;
         }
+        Some(Subcommand::GenerateTs(gen_cli)) => {
+            codex_app_server_protocol::generate_ts(&gen_cli.out_dir, gen_cli.prettier.as_deref())?;
+        }
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
                 // Respect root-level `-c` overrides plus top-level flags like `--profile`.
@@ -611,6 +622,7 @@ fn finalize_resume_interactive(
     root_config_overrides: CliConfigOverrides,
     session_id: Option<String>,
     last: bool,
+    all_dirs: bool,
     resume_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
@@ -619,6 +631,7 @@ fn finalize_resume_interactive(
     interactive.resume_picker = resume_session_id.is_none() && !last;
     interactive.resume_last = last;
     interactive.resume_session_id = resume_session_id;
+    interactive.resume_all_dirs = all_dirs;
 
     // Merge resume-scoped flags and overrides with highest precedence.
     merge_resume_cli_flags(&mut interactive, resume_cli);
@@ -702,13 +715,21 @@ mod tests {
         let Subcommand::Resume(ResumeCommand {
             session_id,
             last,
+            all_dirs,
             config_overrides: resume_cli,
         }) = subcommand.expect("resume present")
         else {
             unreachable!()
         };
 
-        finalize_resume_interactive(interactive, root_overrides, session_id, last, resume_cli)
+        finalize_resume_interactive(
+            interactive,
+            root_overrides,
+            session_id,
+            last,
+            all_dirs,
+            resume_cli,
+        )
     }
 
     fn sample_exit_info(conversation: Option<&str>) -> AppExitInfo {
@@ -767,6 +788,7 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+        assert!(!interactive.resume_all_dirs);
     }
 
     #[test]
@@ -783,6 +805,16 @@ mod tests {
         assert!(!interactive.resume_picker);
         assert!(interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+        assert!(!interactive.resume_all_dirs);
+    }
+
+    #[test]
+    fn resume_all_dirs_flag_sets_field() {
+        let interactive = finalize_from_args(["codex", "resume", "--all-dirs"].as_ref());
+
+        assert!(interactive.resume_picker);
+        assert!(!interactive.resume_last);
+        assert!(interactive.resume_all_dirs);
     }
 
     #[test]
@@ -791,6 +823,7 @@ mod tests {
         assert!(!interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id.as_deref(), Some("1234"));
+        assert!(!interactive.resume_all_dirs);
     }
 
     #[test]
