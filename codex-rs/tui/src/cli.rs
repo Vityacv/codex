@@ -87,4 +87,7 @@ pub struct Cli {
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+
+    #[clap(skip)]
+    pub resume_all_dirs: bool,
 }

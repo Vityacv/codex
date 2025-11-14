@@ -18,7 +18,6 @@ use codex_cli::login::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_common::CliConfigOverrides;
 use codex_exec::Cli as ExecCli;
-use codex_execpolicy::ExecPolicyCheckCommand;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
@@ -94,10 +93,6 @@ enum Subcommand {
     #[clap(visible_alias = "debug")]
     Sandbox(SandboxArgs),
 
-    /// Execpolicy tooling.
-    #[clap(hide = true)]
-    Execpolicy(ExecpolicyCommand),
-
     /// Apply the latest diff produced by Codex agent as a `git apply` to your local working tree.
     #[clap(visible_alias = "a")]
     Apply(ApplyCommand),
@@ -105,6 +100,8 @@ enum Subcommand {
     /// Resume a previous interactive session (picker by default; use --last to continue the most recent).
     Resume(ResumeCommand),
 
+    /// [experimental] Generate TypeScript bindings for the app server protocol.
+    GenerateTs(GenerateTsCommand),
     /// [EXPERIMENTAL] Browse tasks from Codex Cloud and apply changes locally.
     #[clap(name = "cloud", alias = "cloud-tasks")]
     Cloud(CloudTasksCli),
@@ -139,9 +136,9 @@ struct ResumeCommand {
     #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
     last: bool,
 
-    /// Show all sessions (disables cwd filtering and shows CWD column).
-    #[arg(long = "all", default_value_t = false)]
-    all: bool,
+    /// List sessions from every directory instead of filtering to the current working directory.
+    #[arg(long = "all-dirs", default_value_t = false)]
+    all_dirs: bool,
 
     #[clap(flatten)]
     config_overrides: TuiCli,
@@ -165,19 +162,6 @@ enum SandboxCommand {
 
     /// Run a command under Windows restricted token (Windows only).
     Windows(WindowsCommand),
-}
-
-#[derive(Debug, Parser)]
-struct ExecpolicyCommand {
-    #[command(subcommand)]
-    sub: ExecpolicySubcommand,
-}
-
-#[derive(Debug, clap::Subcommand)]
-enum ExecpolicySubcommand {
-    /// Check execpolicy files against a command.
-    #[clap(name = "check")]
-    Check(ExecPolicyCheckCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -345,10 +329,6 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_execpolicycheck(cmd: ExecPolicyCheckCommand) -> anyhow::Result<()> {
-    cmd.run()
-}
-
 #[derive(Debug, Default, Parser, Clone)]
 struct FeatureToggles {
     /// Enable a feature (repeatable). Equivalent to `-c features.<name>=true`.
@@ -474,7 +454,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         Some(Subcommand::Resume(ResumeCommand {
             session_id,
             last,
-            all,
+            all_dirs,
             config_overrides,
         })) => {
             interactive = finalize_resume_interactive(
@@ -482,7 +462,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 root_config_overrides.clone(),
                 session_id,
                 last,
-                all,
+                all_dirs,
                 config_overrides,
             );
             let exit_info = codex_tui::run_main(interactive, codex_linux_sandbox_exe).await?;
@@ -571,9 +551,6 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 .await?;
             }
         },
-        Some(Subcommand::Execpolicy(ExecpolicyCommand { sub })) => match sub {
-            ExecpolicySubcommand::Check(cmd) => run_execpolicycheck(cmd)?,
-        },
         Some(Subcommand::Apply(mut apply_cli)) => {
             prepend_config_flags(
                 &mut apply_cli.config_overrides,
@@ -589,6 +566,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             let socket_path = cmd.socket_path;
             tokio::task::spawn_blocking(move || codex_stdio_to_uds::run(socket_path.as_path()))
                 .await??;
+        }
+        Some(Subcommand::GenerateTs(gen_cli)) => {
+            codex_app_server_protocol::generate_ts(&gen_cli.out_dir, gen_cli.prettier.as_deref())?;
         }
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
@@ -642,7 +622,7 @@ fn finalize_resume_interactive(
     root_config_overrides: CliConfigOverrides,
     session_id: Option<String>,
     last: bool,
-    show_all: bool,
+    all_dirs: bool,
     resume_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
@@ -651,7 +631,7 @@ fn finalize_resume_interactive(
     interactive.resume_picker = resume_session_id.is_none() && !last;
     interactive.resume_last = last;
     interactive.resume_session_id = resume_session_id;
-    interactive.resume_show_all = show_all;
+    interactive.resume_all_dirs = all_dirs;
 
     // Merge resume-scoped flags and overrides with highest precedence.
     merge_resume_cli_flags(&mut interactive, resume_cli);
@@ -735,7 +715,7 @@ mod tests {
         let Subcommand::Resume(ResumeCommand {
             session_id,
             last,
-            all,
+            all_dirs,
             config_overrides: resume_cli,
         }) = subcommand.expect("resume present")
         else {
@@ -747,7 +727,7 @@ mod tests {
             root_overrides,
             session_id,
             last,
-            all,
+            all_dirs,
             resume_cli,
         )
     }
@@ -802,12 +782,13 @@ mod tests {
 
     #[test]
     fn resume_model_flag_applies_when_no_root_flags() {
-        let interactive = finalize_from_args(["codex", "resume", "-m", "gpt-5.1-test"].as_ref());
+        let interactive = finalize_from_args(["codex", "resume", "-m", "gpt-5-test"].as_ref());
 
-        assert_eq!(interactive.model.as_deref(), Some("gpt-5.1-test"));
+        assert_eq!(interactive.model.as_deref(), Some("gpt-5-test"));
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+        assert!(!interactive.resume_all_dirs);
     }
 
     #[test]
@@ -816,7 +797,6 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
-        assert!(!interactive.resume_show_all);
     }
 
     #[test]
@@ -825,7 +805,16 @@ mod tests {
         assert!(!interactive.resume_picker);
         assert!(interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
-        assert!(!interactive.resume_show_all);
+        assert!(!interactive.resume_all_dirs);
+    }
+
+    #[test]
+    fn resume_all_dirs_flag_sets_field() {
+        let interactive = finalize_from_args(["codex", "resume", "--all-dirs"].as_ref());
+
+        assert!(interactive.resume_picker);
+        assert!(!interactive.resume_last);
+        assert!(interactive.resume_all_dirs);
     }
 
     #[test]
@@ -834,14 +823,7 @@ mod tests {
         assert!(!interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id.as_deref(), Some("1234"));
-        assert!(!interactive.resume_show_all);
-    }
-
-    #[test]
-    fn resume_all_flag_sets_show_all() {
-        let interactive = finalize_from_args(["codex", "resume", "--all"].as_ref());
-        assert!(interactive.resume_picker);
-        assert!(interactive.resume_show_all);
+        assert!(!interactive.resume_all_dirs);
     }
 
     #[test]
@@ -859,7 +841,7 @@ mod tests {
                 "--ask-for-approval",
                 "on-request",
                 "-m",
-                "gpt-5.1-test",
+                "gpt-5-test",
                 "-p",
                 "my-profile",
                 "-C",
@@ -870,7 +852,7 @@ mod tests {
             .as_ref(),
         );
 
-        assert_eq!(interactive.model.as_deref(), Some("gpt-5.1-test"));
+        assert_eq!(interactive.model.as_deref(), Some("gpt-5-test"));
         assert!(interactive.oss);
         assert_eq!(interactive.config_profile.as_deref(), Some("my-profile"));
         assert_matches!(

@@ -12,6 +12,7 @@ use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::ConversationId;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use eventsource_stream::Eventsource;
@@ -280,8 +281,14 @@ impl ModelClient {
             attach_item_ids(&mut payload_json, &input_with_instructions);
         }
 
+        let mut current_effort = self.effort;
+        let mut current_verbosity = self.config.model_verbosity;
+        let mut effort_fallback_applied = false;
+        let mut text_fallback_applied = false;
+
         let max_attempts = self.provider.request_max_retries();
-        for attempt in 0..=max_attempts {
+        let mut attempt = 0;
+        while attempt <= max_attempts {
             match self
                 .attempt_stream_responses(attempt, &payload_json, &auth_manager)
                 .await
@@ -289,8 +296,70 @@ impl ModelClient {
                 Ok(stream) => {
                     return Ok(stream);
                 }
-                Err(StreamAttemptError::Fatal(e)) => {
-                    return Err(e);
+                Err(StreamAttemptError::Fatal(err)) => {
+                    if let Some(fallback) = Self::unsupported_value_fallback(&err) {
+                        match fallback {
+                            UnsupportedValueFallback::Reasoning(fallback)
+                                if !effort_fallback_applied
+                                    && Some(fallback.unsupported) == current_effort =>
+                            {
+                                if let Some(next_effort) = fallback.preferred() {
+                                    if Self::set_reasoning_effort(
+                                        &mut payload_json,
+                                        Some(next_effort),
+                                    ) {
+                                        warn!(
+                                            model = %self.config.model,
+                                            unsupported = %fallback.unsupported,
+                                            fallback = %next_effort,
+                                            "Retrying with fallback reasoning effort after rejection"
+                                        );
+                                        current_effort = Some(next_effort);
+                                        effort_fallback_applied = true;
+                                        continue;
+                                    }
+
+                                    warn!(
+                                        model = %self.config.model,
+                                        unsupported = %fallback.unsupported,
+                                        fallback = %next_effort,
+                                        "Failed to update reasoning effort in payload during fallback"
+                                    );
+                                }
+                            }
+                            UnsupportedValueFallback::TextVerbosity(fallback)
+                                if !text_fallback_applied
+                                    && Some(fallback.unsupported) == current_verbosity =>
+                            {
+                                if let Some(next_verbosity) = fallback.preferred() {
+                                    if Self::set_text_verbosity(
+                                        &mut payload_json,
+                                        Some(next_verbosity),
+                                    ) {
+                                        warn!(
+                                            model = %self.config.model,
+                                            unsupported = %fallback.unsupported,
+                                            fallback = %next_verbosity,
+                                            "Retrying with fallback text verbosity after rejection"
+                                        );
+                                        current_verbosity = Some(next_verbosity);
+                                        text_fallback_applied = true;
+                                        continue;
+                                    }
+
+                                    warn!(
+                                        model = %self.config.model,
+                                        unsupported = %fallback.unsupported,
+                                        fallback = %next_verbosity,
+                                        "Failed to update text verbosity in payload during fallback"
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    return Err(err);
                 }
                 Err(retryable_attempt_error) => {
                     if attempt == max_attempts {
@@ -300,6 +369,7 @@ impl ModelClient {
                     tokio::time::sleep(retryable_attempt_error.delay(attempt)).await;
                 }
             }
+            attempt += 1;
         }
 
         unreachable!("stream_responses_attempt should always return");
@@ -498,6 +568,77 @@ impl ModelClient {
         self.session_source.clone()
     }
 
+    fn unsupported_value_fallback(error: &CodexErr) -> Option<UnsupportedValueFallback> {
+        let CodexErr::UnexpectedStatus(unexpected) = error else {
+            return None;
+        };
+
+        let parsed: Option<Value> = serde_json::from_str(&unexpected.body).ok();
+        let (message_opt, param_opt) = parsed
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .map(|error| {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(std::string::ToString::to_string);
+                let param = error
+                    .get("param")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                (message, param)
+            })
+            .unwrap_or((None, None));
+
+        let message = message_opt.or_else(|| parse_raw_message(&unexpected.body))?;
+        let details = parse_unsupported_value_strings(&message)?;
+
+        match param_opt.as_deref() {
+            Some("text.verbosity") => convert_verbosity_fallback(details),
+            Some("reasoning.effort") => convert_reasoning_fallback(details),
+            _ => convert_reasoning_fallback(details.clone())
+                .or_else(|| convert_verbosity_fallback(details)),
+        }
+    }
+
+    fn set_reasoning_effort(payload: &mut Value, effort: Option<ReasoningEffortConfig>) -> bool {
+        if let Some(reasoning) = payload.get_mut("reasoning")
+            && let Some(reasoning_map) = reasoning.as_object_mut()
+        {
+            match effort {
+                Some(value) => {
+                    reasoning_map.insert("effort".to_string(), Value::String(value.to_string()));
+                }
+                None => {
+                    reasoning_map.remove("effort");
+                }
+            }
+
+            return true;
+        }
+
+        false
+    }
+
+    fn set_text_verbosity(payload: &mut Value, verbosity: Option<VerbosityConfig>) -> bool {
+        if let Some(text) = payload.get_mut("text")
+            && let Some(text_map) = text.as_object_mut()
+        {
+            match verbosity {
+                Some(value) => {
+                    text_map.insert("verbosity".to_string(), Value::String(value.to_string()));
+                }
+                None => {
+                    text_map.remove("verbosity");
+                }
+            }
+
+            return true;
+        }
+
+        false
+    }
+
     /// Returns the currently configured model slug.
     pub fn get_model(&self) -> String {
         self.config.model.clone()
@@ -584,6 +725,149 @@ impl ModelClient {
         }
         let CompactHistoryResponse { output } = serde_json::from_str(&body)?;
         Ok(output)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UnsupportedValueStrings {
+    unsupported: String,
+    supported: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ReasoningEffortFallback {
+    unsupported: ReasoningEffortConfig,
+    supported: Vec<ReasoningEffortConfig>,
+}
+
+impl ReasoningEffortFallback {
+    fn preferred(&self) -> Option<ReasoningEffortConfig> {
+        if self.supported.contains(&ReasoningEffortConfig::Medium) {
+            return Some(ReasoningEffortConfig::Medium);
+        }
+
+        self.supported.first().copied()
+    }
+}
+
+#[derive(Debug)]
+struct VerbosityFallback {
+    unsupported: VerbosityConfig,
+    supported: Vec<VerbosityConfig>,
+}
+
+impl VerbosityFallback {
+    fn preferred(&self) -> Option<VerbosityConfig> {
+        if self.supported.contains(&VerbosityConfig::Medium) {
+            return Some(VerbosityConfig::Medium);
+        }
+
+        self.supported.first().copied()
+    }
+}
+
+#[derive(Debug)]
+enum UnsupportedValueFallback {
+    Reasoning(ReasoningEffortFallback),
+    TextVerbosity(VerbosityFallback),
+}
+
+fn parse_raw_message(body: &str) -> Option<String> {
+    if body.contains("Unsupported value:") {
+        Some(body.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_unsupported_value_strings(message: &str) -> Option<UnsupportedValueStrings> {
+    const UNSUPPORTED_PREFIX: &str = "Unsupported value:";
+    const SUPPORTED_PREFIX: &str = "Supported values are:";
+
+    let unsupported_idx = message.find(UNSUPPORTED_PREFIX)?;
+    let after_unsupported = &message[unsupported_idx + UNSUPPORTED_PREFIX.len()..];
+    let after_unsupported = after_unsupported.trim_start();
+    let after_quote = after_unsupported.strip_prefix('\'')?;
+    let unsupported_end = after_quote.find('\'')?;
+    let unsupported_value = after_quote[..unsupported_end].to_string();
+
+    let supported_idx = message.find(SUPPORTED_PREFIX)?;
+    let after_supported = &message[supported_idx + SUPPORTED_PREFIX.len()..];
+    let mut supported = Vec::new();
+    for (idx, segment) in after_supported.split('\'').enumerate() {
+        if idx % 2 == 1 {
+            supported.push(segment.to_string());
+        }
+    }
+
+    if supported.is_empty() {
+        return None;
+    }
+
+    Some(UnsupportedValueStrings {
+        unsupported: unsupported_value,
+        supported,
+    })
+}
+
+fn convert_reasoning_fallback(
+    strings: UnsupportedValueStrings,
+) -> Option<UnsupportedValueFallback> {
+    let unsupported = reasoning_effort_from_str(&strings.unsupported)?;
+    let supported = strings
+        .supported
+        .into_iter()
+        .filter_map(|value| reasoning_effort_from_str(&value))
+        .collect::<Vec<_>>();
+
+    if supported.is_empty() {
+        return None;
+    }
+
+    Some(UnsupportedValueFallback::Reasoning(
+        ReasoningEffortFallback {
+            unsupported,
+            supported,
+        },
+    ))
+}
+
+fn convert_verbosity_fallback(
+    strings: UnsupportedValueStrings,
+) -> Option<UnsupportedValueFallback> {
+    let unsupported = verbosity_from_str(&strings.unsupported)?;
+    let supported = strings
+        .supported
+        .into_iter()
+        .filter_map(|value| verbosity_from_str(&value))
+        .collect::<Vec<_>>();
+
+    if supported.is_empty() {
+        return None;
+    }
+
+    Some(UnsupportedValueFallback::TextVerbosity(VerbosityFallback {
+        unsupported,
+        supported,
+    }))
+}
+
+fn reasoning_effort_from_str(value: &str) -> Option<ReasoningEffortConfig> {
+    match value.trim().to_lowercase().as_str() {
+        "minimal" => Some(ReasoningEffortConfig::Minimal),
+        "low" => Some(ReasoningEffortConfig::Low),
+        "medium" => Some(ReasoningEffortConfig::Medium),
+        "high" => Some(ReasoningEffortConfig::High),
+        _ => None,
+    }
+}
+
+fn verbosity_from_str(value: &str) -> Option<VerbosityConfig> {
+    match value.trim().to_lowercase().as_str() {
+        "low" => Some(VerbosityConfig::Low),
+        "medium" => Some(VerbosityConfig::Medium),
+        "high" => Some(VerbosityConfig::High),
+        _ => None,
     }
 }
 
