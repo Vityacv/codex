@@ -198,17 +198,15 @@ pub fn extract_paths_from_patch(diff_text: &str) -> Vec<String> {
     });
     let mut set = std::collections::BTreeSet::new();
     for caps in RE.captures_iter(diff_text) {
-        if let Some(a) = caps.get(1).map(|m| m.as_str())
-            && a != "/dev/null"
-            && !a.trim().is_empty()
-        {
-            set.insert(a.to_string());
+        if let Some(a) = caps.get(1).map(|m| m.as_str()) {
+            if a != "/dev/null" && !a.trim().is_empty() {
+                set.insert(a.to_string());
+            }
         }
-        if let Some(b) = caps.get(2).map(|m| m.as_str())
-            && b != "/dev/null"
-            && !b.trim().is_empty()
-        {
-            set.insert(b.to_string());
+        if let Some(b) = caps.get(2).map(|m| m.as_str()) {
+            if b != "/dev/null" && !b.trim().is_empty() {
+                set.insert(b.to_string());
+            }
         }
     }
     set.into_iter().collect()
@@ -407,10 +405,11 @@ pub fn parse_git_apply_output(
             if let Some(c) = PATCH_FAILED
                 .captures(line)
                 .or_else(|| DOES_NOT_APPLY.captures(line))
-                && let Some(m) = c.name("path")
             {
-                add(&mut skipped, m.as_str());
-                last_seen_path = Some(m.as_str().to_string());
+                if let Some(m) = c.name("path") {
+                    add(&mut skipped, m.as_str());
+                    last_seen_path = Some(m.as_str().to_string());
+                }
             }
             continue;
         }
