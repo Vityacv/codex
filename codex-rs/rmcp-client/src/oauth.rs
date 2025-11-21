@@ -331,17 +331,17 @@ impl OAuthPersistor {
             }
             None => {
                 let mut last_serialized = self.inner.last_credentials.lock().await;
-                if last_serialized.take().is_some()
-                    && let Err(error) = delete_oauth_tokens(
+                if last_serialized.take().is_some() {
+                    if let Err(error) = delete_oauth_tokens(
                         &self.inner.server_name,
                         &self.inner.url,
                         self.inner.store_mode,
-                    )
-                {
-                    warn!(
-                        "failed to remove OAuth tokens for server {}: {error}",
-                        self.inner.server_name
-                    );
+                    ) {
+                        warn!(
+                            "failed to remove OAuth tokens for server {}: {error}",
+                            self.inner.server_name
+                        );
+                    }
                 }
             }
         }

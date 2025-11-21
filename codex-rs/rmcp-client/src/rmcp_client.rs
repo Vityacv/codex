@@ -253,10 +253,10 @@ impl RmcpClient {
             };
         }
 
-        if let Some(runtime) = oauth_persistor
-            && let Err(error) = runtime.persist_if_needed().await
-        {
-            warn!("failed to persist OAuth tokens after initialize: {error}");
+        if let Some(runtime) = oauth_persistor {
+            if let Err(error) = runtime.persist_if_needed().await {
+                warn!("failed to persist OAuth tokens after initialize: {error}");
+            }
         }
 
         Ok(initialize_result)
@@ -370,18 +370,18 @@ impl RmcpClient {
     /// This should be called after every tool call so that if a given tool call triggered
     /// a refresh of the OAuth tokens, they are persisted.
     async fn persist_oauth_tokens(&self) {
-        if let Some(runtime) = self.oauth_persistor().await
-            && let Err(error) = runtime.persist_if_needed().await
-        {
-            warn!("failed to persist OAuth tokens: {error}");
+        if let Some(runtime) = self.oauth_persistor().await {
+            if let Err(error) = runtime.persist_if_needed().await {
+                warn!("failed to persist OAuth tokens: {error}");
+            }
         }
     }
 
     async fn refresh_oauth_if_needed(&self) {
-        if let Some(runtime) = self.oauth_persistor().await
-            && let Err(error) = runtime.refresh_if_needed().await
-        {
-            warn!("failed to refresh OAuth tokens: {error}");
+        if let Some(runtime) = self.oauth_persistor().await {
+            if let Err(error) = runtime.refresh_if_needed().await {
+                warn!("failed to refresh OAuth tokens: {error}");
+            }
         }
     }
 }
