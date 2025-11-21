@@ -439,23 +439,23 @@ impl From<&CallToolResult> for FunctionCallOutputPayload {
 
         let is_success = is_error != &Some(true);
 
-        if let Some(structured_content) = structured_content
-            && !structured_content.is_null()
-        {
-            match serde_json::to_string(structured_content) {
-                Ok(serialized_structured_content) => {
-                    return FunctionCallOutputPayload {
-                        content: serialized_structured_content,
-                        success: Some(is_success),
-                        ..Default::default()
-                    };
-                }
-                Err(err) => {
-                    return FunctionCallOutputPayload {
-                        content: err.to_string(),
-                        success: Some(false),
-                        ..Default::default()
-                    };
+        if let Some(structured_content) = structured_content {
+            if !structured_content.is_null() {
+                match serde_json::to_string(structured_content) {
+                    Ok(serialized_structured_content) => {
+                        return FunctionCallOutputPayload {
+                            content: serialized_structured_content,
+                            success: Some(is_success),
+                            ..Default::default()
+                        };
+                    }
+                    Err(err) => {
+                        return FunctionCallOutputPayload {
+                            content: err.to_string(),
+                            success: Some(false),
+                            ..Default::default()
+                        };
+                    }
                 }
             }
         }
