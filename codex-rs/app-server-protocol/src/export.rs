@@ -119,19 +119,20 @@ pub fn generate_ts_with_options(
     }
 
     // Optionally run Prettier on all generated TS files.
-    if options.run_prettier
-        && let Some(prettier_bin) = prettier
-        && !ts_files.is_empty()
-    {
-        let status = Command::new(prettier_bin)
-            .arg("--write")
-            .arg("--log-level")
-            .arg("warn")
-            .args(ts_files.iter().map(|p| p.as_os_str()))
-            .status()
-            .with_context(|| format!("Failed to invoke Prettier at {}", prettier_bin.display()))?;
-        if !status.success() {
-            return Err(anyhow!("Prettier failed with status {status}"));
+    if options.run_prettier && !ts_files.is_empty() {
+        if let Some(prettier_bin) = prettier {
+            let status = Command::new(prettier_bin)
+                .arg("--write")
+                .arg("--log-level")
+                .arg("warn")
+                .args(ts_files.iter().map(|p| p.as_os_str()))
+                .status()
+                .with_context(|| {
+                    format!("Failed to invoke Prettier at {}", prettier_bin.display())
+                })?;
+            if !status.success() {
+                return Err(anyhow!("Prettier failed with status {status}"));
+            }
         }
     }
 
@@ -206,36 +207,42 @@ fn build_schema_bundle(schemas: Vec<GeneratedSchema>) -> Result<Value> {
         }
 
         let mut forced_namespace_refs: Vec<(String, String)> = Vec::new();
-        if let Value::Object(ref mut obj) = value
-            && let Some(defs) = obj.remove("definitions")
-            && let Value::Object(defs_obj) = defs
-        {
-            for (def_name, mut def_schema) in defs_obj {
-                if IGNORED_DEFINITIONS.contains(&def_name.as_str()) {
-                    continue;
-                }
-                if SPECIAL_DEFINITIONS.contains(&def_name.as_str()) {
-                    continue;
-                }
-                annotate_schema(&mut def_schema, Some(def_name.as_str()));
-                let target_namespace = match namespace {
-                    Some(ref ns) => Some(ns.clone()),
-                    None => namespace_for_definition(&def_name, &namespaced_types)
-                        .cloned()
-                        .filter(|_| !in_v1_dir),
-                };
-                if let Some(ref ns) = target_namespace {
-                    if namespace.as_deref() == Some(ns.as_str()) {
-                        rewrite_refs_to_namespace(&mut def_schema, ns);
-                        insert_into_namespace(&mut definitions, ns, def_name.clone(), def_schema)?;
-                    } else if !forced_namespace_refs
-                        .iter()
-                        .any(|(name, existing_ns)| name == &def_name && existing_ns == ns)
-                    {
-                        forced_namespace_refs.push((def_name.clone(), ns.clone()));
+        if let Value::Object(ref mut obj) = value {
+            if let Some(defs) = obj.remove("definitions") {
+                if let Value::Object(defs_obj) = defs {
+                    for (def_name, mut def_schema) in defs_obj {
+                        if IGNORED_DEFINITIONS.contains(&def_name.as_str()) {
+                            continue;
+                        }
+                        if SPECIAL_DEFINITIONS.contains(&def_name.as_str()) {
+                            continue;
+                        }
+                        annotate_schema(&mut def_schema, Some(def_name.as_str()));
+                        let target_namespace = match namespace {
+                            Some(ref ns) => Some(ns.clone()),
+                            None => namespace_for_definition(&def_name, &namespaced_types)
+                                .cloned()
+                                .filter(|_| !in_v1_dir),
+                        };
+                        if let Some(ref ns) = target_namespace {
+                            if namespace.as_deref() == Some(ns.as_str()) {
+                                rewrite_refs_to_namespace(&mut def_schema, ns);
+                                insert_into_namespace(
+                                    &mut definitions,
+                                    ns,
+                                    def_name.clone(),
+                                    def_schema,
+                                )?;
+                            } else if !forced_namespace_refs
+                                .iter()
+                                .any(|(name, existing_ns)| name == &def_name && existing_ns == ns)
+                            {
+                                forced_namespace_refs.push((def_name.clone(), ns.clone()));
+                            }
+                        } else {
+                            definitions.insert(def_name, def_schema);
+                        }
                     }
-                } else {
-                    definitions.insert(def_name, def_schema);
                 }
             }
         }
@@ -343,12 +350,12 @@ fn split_namespace(name: &str) -> (Option<&str>, &str) {
 fn rewrite_refs_to_namespace(value: &mut Value, ns: &str) {
     match value {
         Value::Object(obj) => {
-            if let Some(Value::String(r)) = obj.get_mut("$ref")
-                && let Some(suffix) = r.strip_prefix("#/definitions/")
-            {
-                let prefix = format!("{ns}/");
-                if !suffix.starts_with(&prefix) {
-                    *r = format!("#/definitions/{ns}/{suffix}");
+            if let Some(Value::String(r)) = obj.get_mut("$ref") {
+                if let Some(suffix) = r.strip_prefix("#/definitions/") {
+                    let prefix = format!("{ns}/");
+                    if !suffix.starts_with(&prefix) {
+                        *r = format!("#/definitions/{ns}/{suffix}");
+                    }
                 }
             }
             for v in obj.values_mut() {
@@ -419,20 +426,21 @@ fn variant_definition_name(base: &str, variant: &Value) -> Option<String> {
             });
         }
 
-        if props.len() == 1
-            && let Some(key) = props.keys().next()
-        {
-            let pascal = to_pascal_case(key);
-            return Some(format!("{pascal}{base}"));
+        if props.len() == 1 {
+            if let Some(key) = props.keys().next() {
+                let pascal = to_pascal_case(key);
+                return Some(format!("{pascal}{base}"));
+            }
         }
     }
 
-    if let Some(required) = variant.get("required").and_then(Value::as_array)
-        && required.len() == 1
-        && let Some(key) = required[0].as_str()
-    {
-        let pascal = to_pascal_case(key);
-        return Some(format!("{pascal}{base}"));
+    if let Some(required) = variant.get("required").and_then(Value::as_array) {
+        if required.len() == 1 {
+            if let Some(key) = required[0].as_str() {
+                let pascal = to_pascal_case(key);
+                return Some(format!("{pascal}{base}"));
+            }
+        }
     }
 
     None
@@ -466,10 +474,10 @@ fn annotate_schema(value: &mut Value, base: Option<&str>) {
 
 fn annotate_object(map: &mut Map<String, Value>, base: Option<&str>) {
     let owner = map.get("title").and_then(Value::as_str).map(str::to_owned);
-    if let Some(owner) = owner.as_deref()
-        && let Some(Value::Object(props)) = map.get_mut("properties")
-    {
-        set_discriminator_titles(props, owner);
+    if let Some(owner) = owner.as_deref() {
+        if let Some(Value::Object(props)) = map.get_mut("properties") {
+            set_discriminator_titles(props, owner);
+        }
     }
 
     if let Some(Value::Array(variants)) = map.get_mut("oneOf") {
@@ -531,28 +539,30 @@ fn annotate_variant_list(variants: &mut [Value], base: Option<&str>) {
     for variant in variants.iter_mut() {
         let mut variant_name = variant_title(variant).map(str::to_owned);
 
-        if variant_name.is_none()
-            && let Some(base_name) = base
-            && let Some(name) = variant_definition_name(base_name, variant)
-        {
-            let mut candidate = name.clone();
-            let mut index = 2;
-            while seen.contains(&candidate) {
-                candidate = format!("{name}{index}");
-                index += 1;
+        if variant_name.is_none() {
+            if let Some(base_name) = base {
+                if let Some(name) = variant_definition_name(base_name, variant) {
+                    let mut candidate = name.clone();
+                    let mut index = 2;
+                    while seen.contains(&candidate) {
+                        candidate = format!("{name}{index}");
+                        index += 1;
+                    }
+                    if let Some(obj) = variant.as_object_mut() {
+                        obj.insert("title".into(), Value::String(candidate.clone()));
+                    }
+                    seen.insert(candidate.clone());
+                    variant_name = Some(candidate);
+                }
             }
-            if let Some(obj) = variant.as_object_mut() {
-                obj.insert("title".into(), Value::String(candidate.clone()));
-            }
-            seen.insert(candidate.clone());
-            variant_name = Some(candidate);
         }
 
-        if let Some(name) = variant_name.as_deref()
-            && let Some(obj) = variant.as_object_mut()
-            && let Some(Value::Object(props)) = obj.get_mut("properties")
-        {
-            set_discriminator_titles(props, name);
+        if let Some(name) = variant_name.as_deref() {
+            if let Some(obj) = variant.as_object_mut() {
+                if let Some(Value::Object(props)) = obj.get_mut("properties") {
+                    set_discriminator_titles(props, name);
+                }
+            }
         }
 
         annotate_schema(variant, base);
@@ -563,15 +573,16 @@ const DISCRIMINATOR_KEYS: &[&str] = &["type", "method", "mode", "status", "role"
 
 fn set_discriminator_titles(props: &mut Map<String, Value>, owner: &str) {
     for key in DISCRIMINATOR_KEYS {
-        if let Some(prop_schema) = props.get_mut(*key)
-            && string_literal(prop_schema).is_some()
-            && let Value::Object(prop_obj) = prop_schema
-        {
-            if prop_obj.contains_key("title") {
-                continue;
+        if let Some(prop_schema) = props.get_mut(*key) {
+            if string_literal(prop_schema).is_some() {
+                if let Value::Object(prop_obj) = prop_schema {
+                    if prop_obj.contains_key("title") {
+                        continue;
+                    }
+                    let suffix = to_pascal_case(key);
+                    prop_obj.insert("title".into(), Value::String(format!("{owner}{suffix}")));
+                }
             }
-            let suffix = to_pascal_case(key);
-            prop_obj.insert("title".into(), Value::String(format!("{owner}{suffix}")));
         }
     }
 }
