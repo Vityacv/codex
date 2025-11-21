@@ -483,8 +483,7 @@ impl PickerState {
         if matches!(self.sort_mode, SortMode::BackendOrder) {
             return;
         }
-        self.filtered_rows
-            .sort_by(compare_updated_desc);
+        self.filtered_rows.sort_by(compare_updated_desc);
     }
 
     fn toggle_sort_mode(&mut self) {
@@ -506,9 +505,10 @@ impl PickerState {
         self.sort_mode = mode;
         self.apply_filter();
         if let Some(path) = selected_path
-            && let Some(idx) = self.filtered_rows.iter().position(|row| row.path == path) {
-                self.selected = idx;
-            }
+            && let Some(idx) = self.filtered_rows.iter().position(|row| row.path == path)
+        {
+            self.selected = idx;
+        }
         self.ensure_selected_visible();
         self.request_frame();
     }
@@ -725,9 +725,10 @@ fn extract_cwd(head: &[serde_json::Value]) -> Option<PathBuf> {
             return Some(meta_line.meta.cwd);
         }
         if let Ok(line) = serde_json::from_value::<RolloutLine>(value.clone())
-            && let RolloutItem::SessionMeta(meta) = line.item {
-                return Some(meta.meta.cwd);
-            }
+            && let RolloutItem::SessionMeta(meta) = line.item
+        {
+            return Some(meta.meta.cwd);
+        }
     }
     None
 }
