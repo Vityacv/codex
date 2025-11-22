@@ -1857,6 +1857,9 @@ impl ChatWidget {
                 };
                 Some(message)
             }
+            Notification::ElicitationRequested { server_name } => {
+                Some(format!("Approval requested by {server_name}"))
+            }
         }
     }
 
