@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -18,6 +19,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
@@ -280,6 +282,7 @@ struct PickerState {
     action: SessionPickerAction,
     sort_key: ThreadSortKey,
     thread_name_cache: HashMap<ThreadId, Option<String>>,
+    sort_mode: SortMode,
 }
 
 struct PaginationState {
@@ -310,6 +313,25 @@ enum SearchState {
 enum LoadTrigger {
     Scroll,
     Search { token: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortMode {
+    BackendOrder,
+    UpdatedNewestFirst,
+}
+
+impl SortMode {
+    fn description(self) -> &'static str {
+        match self {
+            SortMode::BackendOrder => "Sort: server order",
+            SortMode::UpdatedNewestFirst => "Sort: Updated (newest first)",
+        }
+    }
+
+    fn is_updated(self) -> bool {
+        matches!(self, SortMode::UpdatedNewestFirst)
+    }
 }
 
 impl LoadingState {
@@ -397,6 +419,7 @@ impl PickerState {
             action,
             sort_key: ThreadSortKey::CreatedAt,
             thread_name_cache: HashMap::new(),
+            sort_mode: SortMode::BackendOrder,
         }
     }
 
@@ -413,6 +436,11 @@ impl PickerState {
                     .contains(crossterm::event::KeyModifiers::CONTROL) =>
             {
                 return Ok(Some(SessionSelection::Exit));
+            }
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.toggle_sort_mode();
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
@@ -620,11 +648,46 @@ impl PickerState {
             let q = self.query.to_lowercase();
             self.filtered_rows = base_iter.filter(|r| r.matches_query(&q)).cloned().collect();
         }
+        self.sort_filtered_rows();
         if self.selected >= self.filtered_rows.len() {
             self.selected = self.filtered_rows.len().saturating_sub(1);
         }
         if self.filtered_rows.is_empty() {
             self.scroll_top = 0;
+        }
+        self.ensure_selected_visible();
+        self.request_frame();
+    }
+
+    fn sort_filtered_rows(&mut self) {
+        if matches!(self.sort_mode, SortMode::BackendOrder) {
+            return;
+        }
+        self.filtered_rows.sort_by(compare_updated_desc);
+    }
+
+    fn toggle_sort_mode(&mut self) {
+        let next = match self.sort_mode {
+            SortMode::BackendOrder => SortMode::UpdatedNewestFirst,
+            SortMode::UpdatedNewestFirst => SortMode::BackendOrder,
+        };
+        self.set_sort_mode(next);
+    }
+
+    fn set_sort_mode(&mut self, mode: SortMode) {
+        if self.sort_mode == mode {
+            return;
+        }
+        let selected_path = self
+            .filtered_rows
+            .get(self.selected)
+            .map(|row| row.path.clone());
+        self.sort_mode = mode;
+        self.apply_filter();
+        if let Some(path) = selected_path
+            && let Some(idx) = self.filtered_rows.iter().position(|row| row.path == path)
+        {
+            self.selected = idx;
         }
         self.ensure_selected_visible();
         self.request_frame();
@@ -856,6 +919,19 @@ fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
+fn compare_updated_desc(a: &Row, b: &Row) -> Ordering {
+    let a_key = updated_sort_key(a);
+    let b_key = updated_sort_key(b);
+    match b_key.cmp(&a_key) {
+        Ordering::Equal => a.path.cmp(&b.path),
+        other => other,
+    }
+}
+
+fn updated_sort_key(row: &Row) -> Option<&DateTime<Utc>> {
+    row.updated_at.as_ref().or(row.created_at.as_ref())
+}
+
 fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
     // Render full-screen overlay
     let height = tui.terminal.size()?.height;
@@ -881,18 +957,21 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         .into();
         frame.render_widget_ref(header_line, header);
 
-        // Search line
-        let q = if state.query.is_empty() {
-            "Type to search".dim().to_string()
+        // Search line with sort status
+        let query_span: Span = if state.query.is_empty() {
+            "Type to search".dim()
         } else {
-            format!("Search: {}", state.query)
+            format!("Search: {}", state.query).into()
         };
-        frame.render_widget_ref(Line::from(q), search);
+        let mut search_spans = vec![query_span];
+        search_spans.push("    ".into());
+        search_spans.push(state.sort_mode.description().dim());
+        frame.render_widget_ref(Line::from(search_spans), search);
 
         let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
 
         // Column headers and list
-        render_column_headers(frame, columns, &metrics, state.sort_key);
+        render_column_headers(frame, columns, &metrics, state.sort_key, state.sort_mode);
         render_list(frame, list, state, &metrics);
 
         // Hint line
@@ -914,6 +993,9 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
             "/".dim(),
             key_hint::plain(KeyCode::Down).into(),
             " to browse".dim(),
+            "    ".dim(),
+            key_hint::ctrl(KeyCode::Char('u')).into(),
+            " toggle Updated sort".dim(),
         ]
         .into();
         frame.render_widget_ref(hint_line, hint);
@@ -943,7 +1025,7 @@ fn render_list(
     let labels = &metrics.labels;
     let mut y = area.y;
 
-    let visibility = column_visibility(area.width, metrics, state.sort_key);
+    let visibility = column_visibility(area.width, metrics, state.sort_key, state.sort_mode);
     let max_created_width = metrics.max_created_width;
     let max_updated_width = metrics.max_updated_width;
     let max_branch_width = metrics.max_branch_width;
@@ -1136,13 +1218,14 @@ fn render_column_headers(
     area: Rect,
     metrics: &ColumnMetrics,
     sort_key: ThreadSortKey,
+    sort_mode: SortMode,
 ) {
     if area.height == 0 {
         return;
     }
 
     let mut spans: Vec<Span> = vec!["  ".into()];
-    let visibility = column_visibility(area.width, metrics, sort_key);
+    let visibility = column_visibility(area.width, metrics, sort_key, sort_mode);
     if visibility.show_created {
         let label = format!(
             "{text:<width$}",
@@ -1159,6 +1242,9 @@ fn render_column_headers(
             width = metrics.max_updated_width
         );
         spans.push(Span::from(label).bold());
+        if sort_mode.is_updated() {
+            spans.push(" ▼".cyan());
+        }
         spans.push("  ".into());
     }
     if visibility.show_branch {
@@ -1199,7 +1285,7 @@ struct ColumnMetrics {
 /// Determines which columns to render given available terminal width.
 ///
 /// When the terminal is narrow, only one timestamp column is shown (whichever
-/// matches the current sort key). Branch and CWD are hidden if their max
+/// matches the active sort preference). Branch and CWD are hidden if their max
 /// widths are zero (no data to show).
 #[derive(Debug, PartialEq, Eq)]
 struct ColumnVisibility {
@@ -1279,6 +1365,7 @@ fn column_visibility(
     area_width: u16,
     metrics: &ColumnMetrics,
     sort_key: ThreadSortKey,
+    sort_mode: SortMode,
 ) -> ColumnVisibility {
     const MIN_PREVIEW_WIDTH: usize = 10;
 
@@ -1303,15 +1390,20 @@ fn column_visibility(
 
     // If preview would be too narrow, hide the non-active timestamp column.
     let show_both = preview_width >= MIN_PREVIEW_WIDTH;
+    let preferred_key = if sort_mode.is_updated() {
+        ThreadSortKey::UpdatedAt
+    } else {
+        sort_key
+    };
     let show_created = if show_both {
         metrics.max_created_width > 0
     } else {
-        sort_key == ThreadSortKey::CreatedAt
+        preferred_key == ThreadSortKey::CreatedAt
     };
     let show_updated = if show_both {
         metrics.max_updated_width > 0
     } else {
-        sort_key == ThreadSortKey::UpdatedAt
+        preferred_key == ThreadSortKey::UpdatedAt
     };
 
     ColumnVisibility {
@@ -1653,7 +1745,13 @@ mod tests {
             let area = frame.area();
             let segments =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-            render_column_headers(&mut frame, segments[0], &metrics, state.sort_key);
+            render_column_headers(
+                &mut frame,
+                segments[0],
+                &metrics,
+                state.sort_key,
+                state.sort_mode,
+            );
             render_list(&mut frame, segments[1], &state, &metrics);
         }
         terminal.flush().expect("flush");
@@ -1807,8 +1905,13 @@ mod tests {
             );
 
             frame.render_widget_ref(Line::from("Type to search".dim()), search);
-
-            render_column_headers(&mut frame, columns, &metrics, state.sort_key);
+            render_column_headers(
+                &mut frame,
+                columns,
+                &metrics,
+                state.sort_key,
+                state.sort_mode,
+            );
             render_list(&mut frame, list, &state, &metrics);
 
             let hint_line: Line = vec![
@@ -1922,7 +2025,13 @@ mod tests {
             let area = frame.area();
             let segments =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-            render_column_headers(&mut frame, segments[0], &metrics, state.sort_key);
+            render_column_headers(
+                &mut frame,
+                segments[0],
+                &metrics,
+                state.sort_key,
+                state.sort_mode,
+            );
             render_list(&mut frame, segments[1], &state, &metrics);
         }
         terminal.flush().expect("flush");
@@ -2042,7 +2151,8 @@ mod tests {
             labels: Vec::new(),
         };
 
-        let created = column_visibility(30, &metrics, ThreadSortKey::CreatedAt);
+        let created =
+            column_visibility(30, &metrics, ThreadSortKey::CreatedAt, SortMode::BackendOrder);
         assert_eq!(
             created,
             ColumnVisibility {
@@ -2053,7 +2163,8 @@ mod tests {
             }
         );
 
-        let updated = column_visibility(30, &metrics, ThreadSortKey::UpdatedAt);
+        let updated =
+            column_visibility(30, &metrics, ThreadSortKey::UpdatedAt, SortMode::BackendOrder);
         assert_eq!(
             updated,
             ColumnVisibility {
@@ -2064,7 +2175,24 @@ mod tests {
             }
         );
 
-        let wide = column_visibility(40, &metrics, ThreadSortKey::CreatedAt);
+        let updated_override = column_visibility(
+            30,
+            &metrics,
+            ThreadSortKey::CreatedAt,
+            SortMode::UpdatedNewestFirst,
+        );
+        assert_eq!(
+            updated_override,
+            ColumnVisibility {
+                show_created: false,
+                show_updated: true,
+                show_branch: false,
+                show_cwd: false,
+            }
+        );
+
+        let wide =
+            column_visibility(40, &metrics, ThreadSortKey::CreatedAt, SortMode::BackendOrder);
         assert_eq!(
             wide,
             ColumnVisibility {
