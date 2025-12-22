@@ -1,3 +1,22 @@
+## Fork Notes
+
+This fork carries a few local additions:
+
+- Resume picker: filters by current working directory by default, and <kbd>Ctrl</kbd>+<kbd>U</kbd> toggles sorting by **Updated** (newest first).
+- Automation: `./sync_fork.sh` syncs a fork with upstream (rebase + `--force-with-lease` push); `./update_and_build.sh --allow-alpha` updates the `codex-rs` workspace version to the latest `rust-v*` tag and builds a release binary.
+
+### Expected Uncommitted Changes
+
+After running `./update_and_build.sh`, it’s normal to have local (uncommitted) changes in:
+
+- `codex-rs/Cargo.toml` (workspace package version)
+- `codex-rs/Cargo.lock` (dependency resolution)
+
+If you run `cargo test -p codex-tui`, you may also get pending snapshot files (`*.snap.new`); review and accept via `cargo insta ...` if the UI changes are intentional.
+
+---
+
+
 <p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
