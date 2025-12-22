@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
@@ -35,6 +37,8 @@ use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 
 const PAGE_SIZE: usize = 25;
@@ -257,6 +261,7 @@ struct PickerState {
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     action: SessionPickerAction,
+    sort_mode: SortMode,
 }
 
 struct PaginationState {
@@ -287,6 +292,25 @@ enum SearchState {
 enum LoadTrigger {
     Scroll,
     Search { token: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortMode {
+    BackendOrder,
+    UpdatedNewestFirst,
+}
+
+impl SortMode {
+    fn description(self) -> &'static str {
+        match self {
+            SortMode::BackendOrder => "Sort: server order",
+            SortMode::UpdatedNewestFirst => "Sort: Updated (newest first)",
+        }
+    }
+
+    fn is_updated(self) -> bool {
+        matches!(self, SortMode::UpdatedNewestFirst)
+    }
 }
 
 impl LoadingState {
@@ -352,6 +376,7 @@ impl PickerState {
             show_all,
             filter_cwd,
             action,
+            sort_mode: SortMode::BackendOrder,
         }
     }
 
@@ -368,6 +393,11 @@ impl PickerState {
                     .contains(crossterm::event::KeyModifiers::CONTROL) =>
             {
                 return Ok(Some(SessionSelection::Exit));
+            }
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.toggle_sort_mode();
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
@@ -522,11 +552,46 @@ impl PickerState {
                 .cloned()
                 .collect();
         }
+        self.sort_filtered_rows();
         if self.selected >= self.filtered_rows.len() {
             self.selected = self.filtered_rows.len().saturating_sub(1);
         }
         if self.filtered_rows.is_empty() {
             self.scroll_top = 0;
+        }
+        self.ensure_selected_visible();
+        self.request_frame();
+    }
+
+    fn sort_filtered_rows(&mut self) {
+        if matches!(self.sort_mode, SortMode::BackendOrder) {
+            return;
+        }
+        self.filtered_rows.sort_by(compare_updated_desc);
+    }
+
+    fn toggle_sort_mode(&mut self) {
+        let next = match self.sort_mode {
+            SortMode::BackendOrder => SortMode::UpdatedNewestFirst,
+            SortMode::UpdatedNewestFirst => SortMode::BackendOrder,
+        };
+        self.set_sort_mode(next);
+    }
+
+    fn set_sort_mode(&mut self, mode: SortMode) {
+        if self.sort_mode == mode {
+            return;
+        }
+        let selected_path = self
+            .filtered_rows
+            .get(self.selected)
+            .map(|row| row.path.clone());
+        self.sort_mode = mode;
+        self.apply_filter();
+        if let Some(path) = selected_path
+            && let Some(idx) = self.filtered_rows.iter().position(|row| row.path == path)
+        {
+            self.selected = idx;
         }
         self.ensure_selected_visible();
         self.request_frame();
@@ -735,6 +800,14 @@ fn extract_session_meta_from_head(head: &[serde_json::Value]) -> (Option<PathBuf
             let git_branch = meta_line.git.and_then(|git| git.branch);
             return (cwd, git_branch);
         }
+
+        if let Ok(line) = serde_json::from_value::<RolloutLine>(value.clone()) {
+            if let RolloutItem::SessionMeta(meta) = line.item {
+                let cwd = Some(meta.meta.cwd);
+                let git_branch = meta.git.and_then(|git| git.branch);
+                return (cwd, git_branch);
+            }
+        }
     }
     (None, None)
 }
@@ -762,7 +835,6 @@ fn extract_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .map(|dt| dt.with_timezone(&Utc))
 }
-
 fn preview_from_head(head: &[serde_json::Value]) -> Option<String> {
     head.iter()
         .filter_map(|value| serde_json::from_value::<ResponseItem>(value.clone()).ok())
@@ -770,6 +842,19 @@ fn preview_from_head(head: &[serde_json::Value]) -> Option<String> {
             Some(TurnItem::UserMessage(user)) => Some(user.message()),
             _ => None,
         })
+}
+
+fn compare_updated_desc(a: &Row, b: &Row) -> Ordering {
+    let a_key = updated_sort_key(a);
+    let b_key = updated_sort_key(b);
+    match b_key.cmp(&a_key) {
+        Ordering::Equal => a.path.cmp(&b.path),
+        other => other,
+    }
+}
+
+fn updated_sort_key(row: &Row) -> Option<&DateTime<Utc>> {
+    row.updated_at.as_ref().or(row.created_at.as_ref())
 }
 
 fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
@@ -789,18 +874,21 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         // Header
         frame.render_widget_ref(Line::from(vec![state.action.title().bold().cyan()]), header);
 
-        // Search line
-        let q = if state.query.is_empty() {
-            "Type to search".dim().to_string()
+        // Search line with sort status
+        let query_span: Span = if state.query.is_empty() {
+            "Type to search".dim()
         } else {
-            format!("Search: {}", state.query)
+            format!("Search: {}", state.query).into()
         };
-        frame.render_widget_ref(Line::from(q), search);
+        let mut search_spans = vec![query_span];
+        search_spans.push("    ".into());
+        search_spans.push(state.sort_mode.description().dim());
+        frame.render_widget_ref(Line::from(search_spans), search);
 
         let metrics = calculate_column_metrics(&state.filtered_rows, state.show_all);
 
         // Column headers and list
-        render_column_headers(frame, columns, &metrics);
+        render_column_headers(frame, columns, &metrics, state.sort_mode);
         render_list(frame, list, state, &metrics);
 
         // Hint line
@@ -819,6 +907,9 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
             "/".dim(),
             key_hint::plain(KeyCode::Down).into(),
             " to browse".dim(),
+            "    ".dim(),
+            key_hint::ctrl(KeyCode::Char('u')).into(),
+            " toggle Updated sort".dim(),
         ]
         .into();
         frame.render_widget_ref(hint_line, hint);
@@ -1016,6 +1107,7 @@ fn render_column_headers(
     frame: &mut crate::custom_terminal::Frame,
     area: Rect,
     metrics: &ColumnMetrics,
+    sort_mode: SortMode,
 ) {
     if area.height == 0 {
         return;
@@ -1029,6 +1121,9 @@ fn render_column_headers(
             width = metrics.max_updated_width
         );
         spans.push(Span::from(label).bold());
+        if sort_mode.is_updated() {
+            spans.push(" ▼".cyan());
+        }
         spans.push("  ".into());
     }
     if metrics.max_branch_width > 0 {
@@ -1317,7 +1412,7 @@ mod tests {
             let area = frame.area();
             let segments =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-            render_column_headers(&mut frame, segments[0], &metrics);
+            render_column_headers(&mut frame, segments[0], &metrics, state.sort_mode);
             render_list(&mut frame, segments[1], &state, &metrics);
         }
         terminal.flush().expect("flush");
@@ -1466,7 +1561,7 @@ mod tests {
 
             frame.render_widget_ref(Line::from("Type to search".dim()), search);
 
-            render_column_headers(&mut frame, columns, &metrics);
+            render_column_headers(&mut frame, columns, &metrics, state.sort_mode);
             render_list(&mut frame, list, &state, &metrics);
 
             let hint_line: Line = vec![
